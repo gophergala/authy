@@ -1,90 +1,132 @@
+// Package authy implements the base methods for implementing oauth providers
+// It is recommended instead to use one of the middlewares already provided by the package
+//
+// Middlewares:
+//
+// * Martini: https://github.com/gophergala/authy/martini
+//
+// For a full guide visit https://github.com/gophergala/authy
 package authy
 
 import (
-	"crypto/md5"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/gophergala/authy/oauth2"
 	"github.com/gophergala/authy/provider"
-	"log"
 	"net/http"
-	"regexp"
-	"time"
 )
 
-var providerUrl = regexp.MustCompile("^/connect/([0-9a-z_-]+)$")
-
-func Setup(config Config) error {
-	return SetupMux(config, http.DefaultServeMux)
+// Authy represents the current configuration and cached provider data
+type Authy struct {
+	config    Config
+	providers map[string]provider.ProviderConfig
 }
 
-// Setup Authy on the given ServeMux, if none given, uses DefaultServeMux
-func SetupMux(config Config, mux *http.ServeMux) error {
-	var availableProviders = map[string]provider.ProviderConfig{}
+// Token is returned on a successful auth
+type Token struct {
+	// The actual value of the token
+	Value string
+	// The scopes returned by the provider, some providers may allow the user to change the scope of an auth request
+	// Make sure to check the available scopes before doing queries on their webservices
+	Scope []string
+}
 
-	if mux == nil {
-		mux = http.DefaultServeMux
-	}
+// Parse the configuration and build the list of providers, return an Authy instance
+func NewAuthy(config Config) (Authy, error) {
+	var availableProviders = map[string]provider.ProviderConfig{}
 
 	// load all providers
 	for providerName, providerConfig := range config.Providers {
 		providerData, err := provider.GetProvider(providerName)
 		if err != nil {
-			return err
+			return Authy{}, err
 		}
 		providerConfig.Provider = providerData
 		availableProviders[providerName] = providerConfig
 	}
 
-	// our handler
-	mux.HandleFunc("/connect/", func(rw http.ResponseWriter, r *http.Request) {
-		// Parse incoming requests and redirect to the right providers
-		if providerUrl.MatchString(r.URL.Path) {
-			providerName := providerUrl.FindStringSubmatch(r.URL.Path)[1]
-			providerConfig, ok := availableProviders[providerName]
+	return Authy{
+		config:    config,
+		providers: availableProviders,
+	}, nil
+}
 
-			fmt.Println(providerConfig, ok, providerName)
+// Generate a CSRF token and store it in the provided session object, return the authorisation URL
+// It should be noted that the session object should prevent the user from seeing the sum generated
+func (a Authy) Authorize(providerName string, session Session, r *http.Request) (string, error) {
+	providerConfig, ok := a.providers[providerName]
+	if ok != true {
+		return "", errors.New(fmt.Sprintf("unknown provider %s", providerName))
+	}
 
-			if ok != true {
-				http.NotFound(rw, r)
-				return
-			}
-
-			if providerConfig.Provider.OAuth == 2 {
-				// setup State to prevent any forgery (TODO: break this up in it's own function that his framework aware)
-				rawState := make([]byte, 16)
-				_, err := rand.Read(rawState)
-				if err != nil {
-					http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
-					log.Println("error", err)
-					return
-				}
-
-				sum := md5.Sum(rawState)
-				stateSum := hex.EncodeToString(sum[0:16])
-				http.SetCookie(rw, &http.Cookie{
-					Name:    "state",
-					Value:   stateSum,
-					Expires: time.Now().Add(10 * time.Minute),
-				})
-				providerConfig.State = hex.EncodeToString(rawState)
-
-				// generate authorisation URL
-				redirectUrl, err := oauth2.AuthorizeURL(providerConfig, r)
-
-				if err != nil {
-					http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
-					log.Println("error", err)
-					return
-				}
-
-				// debug
-				rw.Header()["Content-Type"] = []string{"text/html"}
-				fmt.Fprintf(rw, "redirect url: <a href=\"%s\">%s</a>", redirectUrl, redirectUrl)
-			}
+	if providerConfig.Provider.OAuth == 2 {
+		state, err := oauth2.NewState()
+		if err != nil {
+			return "", err
 		}
-	})
 
-	return nil
+		// save authentication state in session
+		session.Set("authy."+providerName+".state", state)
+		providerConfig.State = state
+
+		// generate authorisation URL
+		redirectUrl, err := oauth2.AuthorizeURL(providerConfig, r)
+
+		if err != nil {
+			return "", err
+		}
+
+		return redirectUrl, nil
+	}
+
+	return "", errors.New("Not Implemented")
+}
+
+// Check the CSRF token then query the distant provider for an access token using the code that was provided by the
+// authorization API
+func (a Authy) Access(providerName string, session Session, r *http.Request) (Token, string, error) {
+	providerConfig, ok := a.providers[providerName]
+	if ok != true {
+		return Token{}, "", errors.New(fmt.Sprintf("unknown provider %s", providerName))
+	}
+
+	if providerConfig.Provider.OAuth == 2 {
+		// check the state parameter against CSRF
+		state := session.Get("authy." + providerName + ".state")
+		if state == nil {
+			return Token{}, "", errors.New("state token is not set in session, possible CSRF")
+		}
+
+		stateParam := r.URL.Query().Get("state")
+		if stateParam != state.(string) {
+			return Token{}, "", errors.New("invalid state param provided, possible CSRF")
+		}
+		// we don't need it anymore
+		session.Delete("authy." + providerName + ".state")
+
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			return Token{}, "", errors.New("code was not found in the query parameters")
+		}
+
+		// retrieve access token from provider
+		token, err := oauth2.GetAccessToken(providerConfig, r)
+		if err != nil {
+			return Token{}, "", err
+		}
+
+		// provide the proper callback URL
+		redirectUrl := a.config.Callback
+		if providerConfig.Callback != "" {
+			redirectUrl = providerConfig.Callback
+		}
+
+		// return the token
+		return Token{
+			Value: token.AccessToken,
+			Scope: token.Scope,
+		}, redirectUrl, nil
+	}
+
+	return Token{}, "", errors.New("Not Implemented")
 }
