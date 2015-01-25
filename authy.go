@@ -24,6 +24,8 @@ type Authy struct {
 
 // Token is returned on a successful auth
 type Token struct {
+	// The provider on which that token can be used
+	Provider string
 	// The actual value of the token
 	Value string
 	// The scopes returned by the provider, some providers may allow the user to change the scope of an auth request

@@ -42,8 +42,9 @@ func Authy(config Config) martini.Handler {
 		// if we are already logged, ignore login route matching
 		if tokenValue := s.Get("authy.token.value"); tokenValue != nil {
 			c.Map(Token{
-				Value: tokenValue.(string),
-				Scope: strings.Split(s.Get("authy.token.scope").(string), ","),
+				Provider: s.Get("authy.provider").(string),
+				Value:    tokenValue.(string),
+				Scope:    strings.Split(s.Get("authy.token.scope").(string), ","),
 			})
 			return
 		}
@@ -68,6 +69,7 @@ func Authy(config Config) martini.Handler {
 			}
 
 			// save token in session
+			s.Set("authy.provider", matches[1])
 			s.Set("authy.token.value", token.Value)
 			s.Set("authy.token.scope", strings.Join(token.Scope, ","))
 
